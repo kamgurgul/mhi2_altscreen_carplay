@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -53,6 +54,45 @@
  *  - Convert AVCC H.264 to Annex-B and expose it on 127.0.0.1:19820.
  *  - Main CarPlay stream 110 remains stock-owned.
  */
+
+/*
+ * Build targets
+ *   default             Skoda MHI2 / MU1440 (vehicle-proven; behaviour unchanged).
+ *   ALT111_TARGET_MHI2Q Audi MHI2Q / MU13xx (Qualcomm APQ8064, stock libairplay
+ *                       210.81, Cinemo iAP2). Built by build_altscreen111_mhi2q.sh
+ *                       and preloaded into dio_manager beside the mib2q-carplay-rgi
+ *                       hook. Differences vs MU1440, each for a recorded reason:
+ *    - constructor-free: no thread/dlsym/patch runs from the ELF constructor
+ *      (mib2q-carplay-rgi K1004 loader-lock finding). Everything starts from the
+ *      first interposed AirPlay call; /info always precedes SETUP.
+ *    - PLT interposition by default: the exported AirPlayReceiverSession* symbols
+ *      are the hooks (offline MU1438/MU1440 compare found genuine JUMP_SLOT
+ *      routes). Inline prologue patching stays available behind
+ *      ALTSCREEN111_INLINE_HOOKS=1.
+ *    - stock SETUP is retried without stream 111 if it rejects the combined
+ *      request (210.81 has no type-111 branch).
+ *    - defaults: 1440x540 B9-class cluster canvas, stream 111 on 7111 with
+ *      ephemeral fallback (away from the 6030/6031 MHI2Q port collision).
+ *    - the loopback Annex-B tee is unchanged; on MHI2Q it is consumed by
+ *      altscreen_render (mib2q-carplay-rgi) into cluster displayable 99, not the
+ *      MU1440 MPEG-TS/MOST writer.
+ *  The stock session key observer is unchanged from the MU1440 build.
+ */
+#ifdef ALT111_TARGET_MHI2Q
+#define ALT111_TARGET_NAME "mhi2q"
+#define ALT111_DEFAULT_PORT 7111
+#define ALT111_DEFAULT_ALLOW_EPHEMERAL 1
+#define ALT111_DEFAULT_WIDTH 1440
+#define ALT111_DEFAULT_HEIGHT 540
+#define ALT111_DEFAULT_WIDTH_MM 290
+#else
+#define ALT111_TARGET_NAME "mu1440"
+#define ALT111_DEFAULT_PORT 6031
+#define ALT111_DEFAULT_ALLOW_EPHEMERAL 0
+#define ALT111_DEFAULT_WIDTH 1010
+#define ALT111_DEFAULT_HEIGHT 376
+#define ALT111_DEFAULT_WIDTH_MM 200
+#endif
 
 typedef const void *CFTypeRef;
 typedef const void *CFStringRef;
@@ -238,12 +278,12 @@ static uint64_t g_capture_chunks;
 static uint64_t g_capture_drops;
 
 static int g_enabled = 1;
-static int g_alt_port = 6031;
+static int g_alt_port = ALT111_DEFAULT_PORT;
 static int g_tee_port = 19820;
-static int g_width = 1010;
-static int g_height = 376;
-static int g_width_mm = 200;
-static int g_height_mm = 74;
+static int g_width = ALT111_DEFAULT_WIDTH;
+static int g_height = ALT111_DEFAULT_HEIGHT;
+static int g_width_mm = ALT111_DEFAULT_WIDTH_MM;
+static int g_height_mm = (ALT111_DEFAULT_WIDTH_MM * ALT111_DEFAULT_HEIGHT) / ALT111_DEFAULT_WIDTH;
 static int g_fps = 30;
 static const char *g_fps_override_path = "/mnt/app/root/mibr-carplay111-fps";
 static int g_auto_show = 0;
@@ -300,6 +340,13 @@ static unsigned g2_command_ready;
 static pthread_t g2_control_thread;
 static pthread_t g2_output_thread;
 static int g2_workers_started;
+static pthread_once_t g_runtime_once = PTHREAD_ONCE_INIT;
+static int g_runtime_ok;
+#ifdef ALT111_TARGET_MHI2Q
+static int g_mhi2q_want_inline;
+static void gen2_install_inline_hooks(void);
+#endif
+static int gen2_configure_profile(void);
 static const char *g2_status_path = "/tmp/mibr-alt111-gen2.status";
 static const char *g2_reacquire_marker = "/tmp/mibr-alt111-gen2-reacquire";
 static const char *g2_diag_stop_marker = "/tmp/mibr-alt111-stop-only";
@@ -340,6 +387,8 @@ static void capture_drop_client_locked(void);
 static void capture_mirror_send(const uint8_t *p, size_t n,
                                 const struct alt111_output_ticket *ticket);
 static int start_capture_server(void);
+static void gen2_runtime_ready(void);
+static void gen2_resolve_stock_targets(void);
 
 static void logf_u2(const char *fmt, ...)
 {
@@ -1571,6 +1620,30 @@ static void *alt_receiver_thread(void *arg)
     int listen_fd = (int)(intptr_t)arg;
     int c;
     logf_u2("waiting for iPhone AltScreen connection on 0.0.0.0:%d", g_alt_port);
+#ifdef ALT111_TARGET_MHI2Q
+    /*
+     * On MHI2Q the first question after SETUP is whether the iPhone can reach
+     * this port (unit firewall / interface binding). Wait in 1 s slices so a
+     * silent listener is logged and stop_alt_receiver() is observed within 1 s.
+     */
+    {
+        unsigned waited = 0;
+        for (;;) {
+            fd_set rd; struct timeval tv; int n, current;
+            pthread_mutex_lock(&g_lock); current = g_alt_listen; pthread_mutex_unlock(&g_lock);
+            if (current != listen_fd) break;
+            FD_ZERO(&rd); FD_SET(listen_fd, &rd);
+            tv.tv_sec = 1; tv.tv_usec = 0;
+            n = select(listen_fd + 1, &rd, NULL, NULL, &tv);
+            if (n > 0) break;
+            if (n < 0 && errno != EINTR) break;
+            if (n == 0 && (++waited == 10u || waited % 60u == 0u))
+                logf_u2("MHI2Q stream111: no iPhone connection on port %d after %us "
+                        "(SETUP answered; check unit firewall / CarPlay interface binding)",
+                        g_alt_port, waited);
+        }
+    }
+#endif
     c = accept(listen_fd, NULL, NULL);
     if (c < 0) { logf_u2("AltScreen accept failed: %s", strerror(errno)); return NULL; }
     pthread_mutex_lock(&g_lock); g_alt_client = c; pthread_mutex_unlock(&g_lock);
@@ -1682,7 +1755,7 @@ static int start_alt_receiver(uint64_t connection_id)
 {
     uint8_t key[16], iv[16];
     int actual = 0;
-    int allow_ephemeral = env_i("ALTSCREEN111_ALLOW_EPHEMERAL", 0);
+    int allow_ephemeral = env_i("ALTSCREEN111_ALLOW_EPHEMERAL", ALT111_DEFAULT_ALLOW_EPHEMERAL);
 
     /* Complete previous worker teardown before reusing global session state. */
     stop_alt_receiver();
@@ -2210,8 +2283,10 @@ CFDictionaryRef AirPlayCopyServerInfo(AirPlayReceiverSessionRef session, CFArray
     CFStringRef kdisplays=NULL;
     CFArrayRef old=NULL;
     CFMutableArrayRef displays=NULL;
-    int advertised_fps=current_advertised_fps();
+    int advertised_fps;
 
+    gen2_runtime_ready();
+    advertised_fps=current_advertised_fps();
     if(!g_real_serverinfo)g_real_serverinfo=(fn_serverinfo_t)sym_next("AirPlayCopyServerInfo");
     if(!g_real_serverinfo){
         logf_u2("AirPlayCopyServerInfo stock delegate unavailable");
@@ -2995,9 +3070,30 @@ static int install_arm_hook(void *target, void *replacement, void **trampoline, 
     return install_arm_hook_expected(target,replacement,trampoline,name,0xe92d4ff0u,0xed2d8b02u);
 }
 
+/*
+ * Resolve the stock delegates. Idempotent and never fatal: the MU1440
+ * constructor calls it before hooking, the MHI2Q lazy start calls it, and every
+ * call_stock_* retries it when its pointer is still NULL, so an interposed call
+ * always reaches stock.
+ */
+static void gen2_resolve_stock_targets(void)
+{
+    if(!g_real_setup)g_real_setup=(fn_setup_t)sym_next("AirPlayReceiverSessionSetup");
+    if(!g_real_start)g_real_start=(fn_start_t)sym_next("AirPlayReceiverSessionStart");
+    if(!g_real_teardown)g_real_teardown=(fn_teardown_t)sym_next("AirPlayReceiverSessionTearDown");
+    if(!g_real_platform_control)
+        g_real_platform_control=(fn_platform_control_t)sym_next("AirPlayReceiverSessionPlatformControl");
+    if(!g_real_session_control)
+        g_real_session_control=(fn_session_control_t)sym_next("AirPlayReceiverSessionControl");
+    if(!g_make_mode_state)
+        g_make_mode_state=(fn_make_mode_state_t)sym_next("AirPlayReceiverSessionMakeModeStateFromDictionary");
+    if(!g_real_serverinfo)g_real_serverinfo=(fn_serverinfo_t)sym_next("AirPlayCopyServerInfo");
+}
+
 static OSStatus call_stock_setup(AirPlayReceiverSessionRef s, CFDictionaryRef request, CFDictionaryRef *outResponse)
 {
     fn_setup_t fn = g_setup_trampoline ? g_setup_trampoline : g_real_setup;
+    if(!fn){ gen2_resolve_stock_targets(); fn=g_real_setup; }
     if(!fn){
         logf_u2("FATAL no stock SessionSetup delegate");
         return -1;
@@ -3008,6 +3104,7 @@ static OSStatus call_stock_setup(AirPlayReceiverSessionRef s, CFDictionaryRef re
 static OSStatus call_stock_start(AirPlayReceiverSessionRef s, void *info)
 {
     fn_start_t fn = g_start_trampoline ? g_start_trampoline : g_real_start;
+    if(!fn){ gen2_resolve_stock_targets(); fn=g_real_start; }
     if(!fn){
         logf_u2("FATAL no stock SessionStart delegate");
         return -1;
@@ -3018,6 +3115,7 @@ static OSStatus call_stock_start(AirPlayReceiverSessionRef s, void *info)
 static void call_stock_teardown(AirPlayReceiverSessionRef s, CFDictionaryRef request, OSStatus reason, Boolean *outDone)
 {
     fn_teardown_t fn = g_teardown_trampoline ? g_teardown_trampoline : g_real_teardown;
+    if(!fn){ gen2_resolve_stock_targets(); fn=g_real_teardown; }
     if(!fn){
         logf_u2("FATAL no stock SessionTearDown delegate");
         if(outDone)*outDone=1;
@@ -3033,6 +3131,7 @@ static OSStatus call_stock_session_control(AirPlayReceiverSessionRef session, ui
 {
     fn_session_control_t fn=g_session_control_trampoline?
         g_session_control_trampoline:g_real_session_control;
+    if(!fn){ gen2_resolve_stock_targets(); fn=g_real_session_control; }
     if(!fn){
         logf_u2("FATAL no stock SessionControl delegate");
         return -1;
@@ -3049,6 +3148,7 @@ static OSStatus mibr_session_control(AirPlayReceiverSessionRef session, uint32_t
     const char *c;
     int private111_active=0;
 
+    gen2_runtime_ready();
     flight_record_session_control(session,flags,command,qualifier,params,outParams);
     e=call_stock_session_control(session,flags,command,qualifier,params,outParams);
     c=flight_command_cstr(command,cbuf,sizeof(cbuf));
@@ -3133,6 +3233,7 @@ static OSStatus call_stock_platform_control(AirPlayReceiverSessionRef session, u
 {
     fn_platform_control_t fn=g_platform_control_trampoline?
         g_platform_control_trampoline:g_real_platform_control;
+    if(!fn){ gen2_resolve_stock_targets(); fn=g_real_platform_control; }
     if(!fn){
         logf_u2("FATAL no stock PlatformControl delegate");
         return -1;
@@ -3149,6 +3250,7 @@ static OSStatus mibr_platform_control(AirPlayReceiverSessionRef session, uint32_
     const char *c;
     int private111_active=0;
 
+    gen2_runtime_ready();
     flight_record_platform_control(session,flags,command,qualifier,params,outParams);
     e=call_stock_platform_control(session,flags,command,qualifier,params,outParams);
     c=flight_command_cstr(command,cbuf,sizeof(cbuf));
@@ -3203,6 +3305,7 @@ static OSStatus mibr_session_setup(AirPlayReceiverSessionRef s, CFDictionaryRef 
     int port=-1;
     uint64_t cid=0;
 
+    gen2_runtime_ready();
     log_stream_types("SETUP entry",request);
 
     /*
@@ -3212,6 +3315,24 @@ static OSStatus mibr_session_setup(AirPlayReceiverSessionRef s, CFDictionaryRef 
      */
     e=call_stock_setup(s,request,&stockResp);
     logf_u2("SETUP stock result=%d response=%s",(int)e,stockResp?"yes":"no");
+#ifdef ALT111_TARGET_MHI2Q
+    /*
+     * 210.81 has no type-111 branch. If it fails a request carrying stream 111,
+     * give stock the request it understands and append 111 ourselves as usual.
+     */
+    if(e!=K_NO_ERR && g_enabled && contains_stream111(request,NULL,&other)){
+        CFMutableDictionaryRef stripped=clone_without_111(request);
+        logf_u2("MHI2Q stock SETUP rejected a stream111 request rc=%d; retrying without 111 otherStreams=%d",
+                (int)e,other);
+        if(stockResp){p_CFRelease(stockResp);stockResp=NULL;}
+        if(stripped){
+            e=call_stock_setup(s,stripped,&stockResp);
+            p_CFRelease(stripped);
+            logf_u2("MHI2Q stock SETUP retry result=%d response=%s",(int)e,stockResp?"yes":"no");
+        }
+        other=0;
+    }
+#endif
     if(e==K_NO_ERR && g_enabled) set_active_session(s);
     if(e!=K_NO_ERR){
         if(outResponse)*outResponse=stockResp;
@@ -3253,6 +3374,11 @@ static OSStatus mibr_session_setup(AirPlayReceiverSessionRef s, CFDictionaryRef 
         if(port>0 && stockResp){
             append_alt_setup_response((CFMutableDictionaryRef)stockResp,altDesc,port);
             gen2_control_projection_on();
+#ifdef ALT111_TARGET_MHI2Q
+            /* SessionStart is not a proven PLT seam on 210.81; a stream-111 SETUP
+             * only arrives on a running session, so arm the control worker here. */
+            gen2_set_command_ready(1);
+#endif
             logf_u2("GEN2 stream111 SETUP accepted cid=%llu dataPort=%d response=cloned-request+streamID111; UI acquisition armed",
                     (unsigned long long)cid,port);
         }else{
@@ -3271,7 +3397,9 @@ static OSStatus mibr_session_setup(AirPlayReceiverSessionRef s, CFDictionaryRef 
 
 static OSStatus mibr_session_start(AirPlayReceiverSessionRef s, void *info)
 {
-    OSStatus e=call_stock_start(s,info);
+    OSStatus e;
+    gen2_runtime_ready();
+    e=call_stock_start(s,info);
     if(e==K_NO_ERR && g_enabled) {
         set_active_session(s);
         gen2_set_command_ready(1);
@@ -3294,6 +3422,7 @@ static void mibr_session_teardown(AirPlayReceiverSessionRef s, CFDictionaryRef r
     int other=0;
     int has_alt;
 
+    gen2_runtime_ready();
     if(!g_enabled){
         call_stock_teardown(s,request,reason,outDone);
         return;
@@ -3379,6 +3508,7 @@ OSStatus AES_CBCFrame_Init(void *ctx, const uint8_t key[16], const uint8_t iv[16
 {
     void *ra=__builtin_return_address(0);
     OSStatus e;
+    gen2_runtime_ready();
     if(!g_real_aes_cbc_init)g_real_aes_cbc_init=(fn_aes_cbc_init_t)sym_next("AES_CBCFrame_Init");
     e=g_real_aes_cbc_init(ctx,key,iv,encrypt);
     if(g_enabled && e==K_NO_ERR && !encrypt && g_security_fn &&
@@ -3389,22 +3519,143 @@ OSStatus AES_CBCFrame_Init(void *ctx, const uint8_t key[16], const uint8_t iv[16
     return e;
 }
 
+static int gen2_configure_profile(void)
+{
+    alt111_profile_mu1440(&g2_profile,0);
+    if(g_width<=0 || g_height<=0 || g_width_mm<=0 || g_height_mm<=0 ||
+       g_fps<=0 || g_fps>60){
+        logf_u2("gen2 invalid runtime geometry/fps %dx%d physical=%dx%d fps=%d",
+                g_width,g_height,g_width_mm,g_height_mm,g_fps);
+        return -1;
+    }
+    if(strlen(g_alt_uuid)!=36u){
+        logf_u2("gen2 invalid secondary display UUID length=%zu",strlen(g_alt_uuid));
+        return -1;
+    }
+    memcpy(g2_profile.uuid,g_alt_uuid,37u);
+    g2_profile.width=(uint32_t)g_width;
+    g2_profile.height=(uint32_t)g_height;
+    g2_profile.width_mm=(uint32_t)g_width_mm;
+    g2_profile.height_mm=(uint32_t)g_height_mm;
+    g2_profile.max_fps=(uint32_t)g_fps;
+    g2_profile.views[0].area.width=g2_profile.width;
+    g2_profile.views[0].area.height=g2_profile.height;
+    g2_profile.views[0].safe=g2_profile.views[0].area;
+    if(alt111_profile_validate(&g2_profile)!=ALT111_OK){
+        logf_u2("gen2 runtime profile validation failed");
+        return -1;
+    }
+    if(alt111_control_init(&g2_control,g2_profile.view_count)!=ALT111_OK){
+        logf_u2("gen2 control init failed");
+        return -1;
+    }
+    alt111_video_init(&g2_video);
+    alt111_resync_init(&g2_resync);
+    return 0;
+}
+
+#ifdef ALT111_TARGET_MHI2Q
+/*
+ * Optional inline-hook install for MHI2Q (ALTSCREEN111_INLINE_HOOKS=1). Default
+ * is PLT interposition of the exported AirPlayReceiverSession* symbols. The
+ * prologue expectations are the MU1438 (AUG22) offline-observed values; on a
+ * different MHI2Q firmware install_arm_hook_expected() self-logs the actual
+ * first two instruction words and skips only that function (PLT stays active).
+ */
+static void gen2_install_inline_hooks(void)
+{
+    void *setup=sym_next("AirPlayReceiverSessionSetup");
+    void *start=sym_next("AirPlayReceiverSessionStart");
+    void *td=sym_next("AirPlayReceiverSessionTearDown");
+    void *platform=sym_next("AirPlayReceiverSessionPlatformControl");
+    void *control=sym_next("AirPlayReceiverSessionControl");
+    if(!setup||!start||!td||!platform||!control){
+        logf_u2("MHI2Q inline hooks: missing target(s); staying on PLT interposition only");
+        return;
+    }
+    (void)install_arm_hook(setup,(void*)mibr_session_setup,
+                           (void**)&g_setup_trampoline,"SessionSetup(MHI2Q)");
+    (void)install_arm_hook(start,(void*)mibr_session_start,
+                           (void**)&g_start_trampoline,"SessionStart(MHI2Q)");
+    (void)install_arm_hook(td,(void*)mibr_session_teardown,
+                           (void**)&g_teardown_trampoline,"SessionTearDown(MHI2Q)");
+    (void)install_arm_hook_expected(platform,(void*)mibr_platform_control,
+                                    (void**)&g_platform_control_trampoline,
+                                    "PlatformControl(MHI2Q)",0xe92d4ff0u,0xed2d8b04u);
+    (void)install_arm_hook_expected(control,(void*)mibr_session_control,
+                                    (void**)&g_session_control_trampoline,
+                                    "SessionControl(MHI2Q)",0xe92d4ff0u,0xe1a06002u);
+}
+#endif
+
+/*
+ * Deferred runtime start (threads, dlsym, servers). Runs once from the first
+ * interposed AirPlay call, never from the ELF constructor, so no pthread or
+ * loader work happens while the QNX loader lock is held (mib2q-carplay-rgi
+ * K1004). MHI2Q only; MU1440 finishes init in the constructor.
+ */
+#ifdef ALT111_TARGET_MHI2Q
+static void gen2_runtime_start(void)
+{
+    if(!g_enabled) return;
+    if(init_api()!=0){
+        g_enabled=0; publish_state("error");
+        logf_u2("GEN2 lazy init: API resolution failed"); return;
+    }
+    gen2_resolve_stock_targets();
+    if(gen2_start_workers()!=0){
+        g_enabled=0; publish_state("error");
+        logf_u2("GEN2 lazy init: worker start failed"); return;
+    }
+    if(start_tee_server()!=0){
+        g_enabled=0; publish_state("error");
+        logf_u2("GEN2 lazy init: local H264 tee bind failed; disabled fail-closed"); return;
+    }
+    if(start_capture_server()!=0)
+        logf_u2("GEN2 lazy init: diagnostic capture mirror unavailable; production path unchanged");
+#ifdef ALT111_TARGET_MHI2Q
+    if(g_mhi2q_want_inline) gen2_install_inline_hooks();
+#endif
+    g_runtime_ok=1;
+    publish_state("ready");
+    {
+        char active_url[384];
+        active_alt_url_copy(active_url,sizeof(active_url));
+        logf_u2("GEN2 lazy runtime ready target=%s 111=%dx%d@%d physical=%dx%d altPort=%d tee=%d capture=%d URL=%s uuid=%s viewAreas=%d",
+                ALT111_TARGET_NAME,g_width,g_height,g_fps,g_width_mm,g_height_mm,
+                g_alt_port,g_tee_port,g_capture_port,active_url,g_alt_uuid,g_viewareas);
+    }
+}
+#endif /* ALT111_TARGET_MHI2Q */
+
+static void gen2_runtime_ready(void)
+{
+#ifdef ALT111_TARGET_MHI2Q
+    (void)pthread_once(&g_runtime_once,gen2_runtime_start);
+#else
+    (void)g_runtime_once; (void)g_runtime_ok;
+#endif
+}
+
 __attribute__((constructor))
 static void altscreen111_init(void)
 {
     char active_url[384];
+#ifndef ALT111_TARGET_MHI2Q
     void *setup,*start,*td,*platform,*control;
+#endif
     signal(SIGPIPE,SIG_IGN);
     g_enabled=env_i("ALTSCREEN111_ENABLED",1);
-    g_alt_port=env_i("ALTSCREEN111_PORT",6031);
+    g_alt_port=env_i("ALTSCREEN111_PORT",ALT111_DEFAULT_PORT);
     g_tee_port=env_i("ALTSCREEN111_TEE_PORT",19820);
     g_capture_port=env_i("ALTSCREEN111_CAPTURE_PORT",19821);
-    g_width=env_i("ALTSCREEN111_WIDTH",1010);
-    g_height=env_i("ALTSCREEN111_HEIGHT",376);
-    /* Keep MU-target physical geometry; Audi 290x90 is not portable evidence. */
-    g_width_mm=env_i("ALTSCREEN111_WIDTH_MM",200);
+    g_width=env_i("ALTSCREEN111_WIDTH",ALT111_DEFAULT_WIDTH);
+    g_height=env_i("ALTSCREEN111_HEIGHT",ALT111_DEFAULT_HEIGHT);
+    /* Physical geometry defaults are per-target (ALT111_DEFAULT_* block). */
+    g_width_mm=env_i("ALTSCREEN111_WIDTH_MM",ALT111_DEFAULT_WIDTH_MM);
     g_height_mm=env_i("ALTSCREEN111_HEIGHT_MM",
-                      g_width>0 ? (200*g_height)/g_width : 74);
+                      g_width>0 ? (g_width_mm*g_height)/g_width
+                                : (ALT111_DEFAULT_WIDTH_MM*ALT111_DEFAULT_HEIGHT)/ALT111_DEFAULT_WIDTH);
     g_fps=env_i("ALTSCREEN111_FPS",30);
     /*
      * Reference IRC does not prove startup showUI/forceKeyFrame. Ignore the
@@ -3427,42 +3678,26 @@ static void altscreen111_init(void)
         return;
     }
 
-    alt111_profile_mu1440(&g2_profile,0);
-    if(g_width<=0 || g_height<=0 || g_width_mm<=0 || g_height_mm<=0 ||
-       g_fps<=0 || g_fps>60){
-        logf_u2("gen2 invalid runtime geometry/fps %dx%d physical=%dx%d fps=%d",
-                g_width,g_height,g_width_mm,g_height_mm,g_fps);
-        publish_state("error");
-        return;
-    }
-    if(strlen(g_alt_uuid)!=36u){
-        logf_u2("gen2 invalid secondary display UUID length=%zu",strlen(g_alt_uuid));
-        publish_state("error");
-        return;
-    }
-    memcpy(g2_profile.uuid,g_alt_uuid,37u);
-    g2_profile.width=(uint32_t)g_width;
-    g2_profile.height=(uint32_t)g_height;
-    g2_profile.width_mm=(uint32_t)g_width_mm;
-    g2_profile.height_mm=(uint32_t)g_height_mm;
-    g2_profile.max_fps=(uint32_t)g_fps;
-    g2_profile.views[0].area.width=g2_profile.width;
-    g2_profile.views[0].area.height=g2_profile.height;
-    g2_profile.views[0].safe=g2_profile.views[0].area;
-    if(alt111_profile_validate(&g2_profile)!=ALT111_OK){
+    if(gen2_configure_profile()!=0){
         g_enabled=0;
-        logf_u2("gen2 runtime profile validation failed; disabled fail-closed");
         publish_state("error");
         return;
     }
-    if(alt111_control_init(&g2_control,g2_profile.view_count)!=ALT111_OK){
+
+#ifdef ALT111_TARGET_MHI2Q
+    g_mhi2q_want_inline=env_i("ALTSCREEN111_INLINE_HOOKS",0);
+    active_alt_url_copy(active_url,sizeof(active_url));
+    logf_u2("GEN2 MHI2Q constructor complete (deferred runtime): 111=%dx%d@%d physical=%dx%d altPort=%d tee=%d capture=%d URL=%s uuid=%s viewAreas=%d inlineHooks=%d bit26Mode=%d",
+            g_width,g_height,g_fps,g_width_mm,g_height_mm,g_alt_port,g_tee_port,g_capture_port,
+            active_url,g_alt_uuid,g_viewareas,g_mhi2q_want_inline,airplay_bit26_mode());
+    return;
+#else
+    if(init_api()!=0){
         g_enabled=0;
-        logf_u2("gen2 control init failed; disabled fail-closed");
         publish_state("error");
+        logf_u2("GEN2 disabled: API initialization failed");
         return;
     }
-    alt111_video_init(&g2_video);
-    alt111_resync_init(&g2_resync);
     if(gen2_start_workers()!=0){
         g_enabled=0;
         logf_u2("gen2 worker start failed; disabled fail-closed");
@@ -3475,10 +3710,6 @@ static void altscreen111_init(void)
         logf_u2("cannot start local H264 tee; AltScreen disabled fail-closed");
         return;
     }
-    /*
-     * Diagnostic mirror failure is non-fatal. The production tee/remux path
-     * must remain usable even if the optional capture port cannot bind.
-     */
     if(start_capture_server()!=0)
         logf_u2("GEN2 diagnostic H264 capture mirror unavailable; production path unchanged");
     setup=sym_next("AirPlayReceiverSessionSetup");
@@ -3526,4 +3757,5 @@ static void altscreen111_init(void)
             gen2_d2_enabled() ? "enabled" : "disabled",
             G2_D2_EVENT_DELAY_MS,G2_D2_WATCHDOG_MS,G2_D2_MIN_GAP_MS,
             g2_d2_enable_marker,g2_d2_persist_marker);
+#endif
 }
