@@ -287,6 +287,9 @@ static int g_height_mm = (ALT111_DEFAULT_WIDTH_MM * ALT111_DEFAULT_HEIGHT) / ALT
 static int g_fps = 30;
 static const char *g_fps_override_path = "/mnt/app/root/mibr-carplay111-fps";
 static int g_auto_show = 0;
+/* 0 = leave /info byte-for-byte stock (no AltScreen advertisement). Diagnostic
+ * lever: if a sender only works with this off, the advertisement is the cause. */
+static int g_advertise = 1;
 static int g_viewareas = 1;
 static const char *g_viewareas_marker = "/mnt/app/root/mibr-carplay111-viewareas.enabled";
 static const char *g_safearea_config_path = "/mnt/app/root/mibr-carplay111-safearea.conf";
@@ -985,24 +988,115 @@ static int current_advertised_fps(void)
     return g_fps;
 }
 
+/* ASCII compare of a CFString. Local so this works before the flight helpers. */
+static int cf_is_ascii(CFStringRef v, const char *want)
+{
+    char buf[64];
+    const char *p;
+    if(!v || !want) return 0;
+    p = p_CFStringGetCStringPtr(v, CF_UTF8);
+    if(!p){
+        if(!p_CFStringGetCString(v, buf, (CFIndex)sizeof(buf), CF_UTF8)) return 0;
+        p = buf;
+    }
+    return strcmp(p, want) == 0;
+}
+
+/*
+ * MERGE our capability flags into the existing enabledFeatures array.
+ *
+ * This used to build a fresh array and overwrite the key, which DESTROYED every
+ * feature stock advertised. A sender that needs one of those features then fails
+ * to negotiate -- observed on this platform as wireless CarPlay (dongle) no
+ * longer connecting, and as the phone never requesting stream 111 (so the
+ * cluster kept showing only the maneuver arrow). Preserve stock, append ours
+ * only when absent, and never duplicate.
+ */
 static void set_reference_enabled_features(CFMutableDictionaryRef response)
 {
     CFStringRef k = NULL, alt = NULL, va = NULL;
+    CFTypeRef existing;
     CFMutableArrayRef a = NULL;
+    CFIndex i, stock_n = 0;
+    int have_alt = 0, have_va = 0, changed = 0;
+
     if(!response) return;
-
     k = s_cf("enabledFeatures");
-    alt = s_cf("altScreen");
-    va = s_cf("viewAreas");
-    a = p_CFArrayCreateMutable(NULL,0,p_array_callbacks);
-    if(a && alt) p_CFArrayAppendValue(a,alt);
-    if(a && va && g_viewareas) p_CFArrayAppendValue(a,va);
-    if(a && k) p_CFDictionarySetValue(response,k,a);
+    if(!k) return;
 
-    if(a) p_CFRelease(a);
+    existing = (CFTypeRef)p_CFDictionaryGetValue(response, k);
+    if(existing && p_CFGetTypeID(existing) == p_CFArrayGetTypeID()){
+        a = p_CFArrayCreateMutableCopy(NULL, 0, (CFArrayRef)existing);
+        if(a) stock_n = p_CFArrayGetCount(a);
+    }else{
+        a = p_CFArrayCreateMutable(NULL, 0, p_array_callbacks);
+    }
+    if(!a){ p_CFRelease(k); return; }
+
+    for(i = 0; i < stock_n; ++i){
+        CFTypeRef it = p_CFArrayGetValueAtIndex(a, i);
+        if(!it || p_CFGetTypeID(it) != p_CFStringGetTypeID()) continue;
+        if(cf_is_ascii((CFStringRef)it, "altScreen")) have_alt = 1;
+        else if(cf_is_ascii((CFStringRef)it, "viewAreas")) have_va = 1;
+    }
+
+    if(!have_alt){
+        alt = s_cf("altScreen");
+        if(alt){ p_CFArrayAppendValue(a, alt); changed = 1; }
+    }
+    if(g_viewareas && !have_va){
+        va = s_cf("viewAreas");
+        if(va){ p_CFArrayAppendValue(a, va); changed = 1; }
+    }
+
+    /* Only write the key back when we actually added something, or when stock
+     * had no (array) value at all. Never replace a stock array with a copy for
+     * no reason. */
+    if(changed || !existing || p_CFGetTypeID(existing) != p_CFArrayGetTypeID())
+        p_CFDictionarySetValue(response, k, a);
+
+    logf_u2("GEN2 enabledFeatures merge: stockEntries=%ld altScreen=%s viewAreas=%s total=%ld",
+            (long)stock_n,
+            have_alt ? "already-present" : (alt ? "appended" : "FAILED"),
+            g_viewareas ? (have_va ? "already-present" : (va ? "appended" : "FAILED"))
+                        : "disabled",
+            (long)p_CFArrayGetCount(a));
+
     if(va) p_CFRelease(va);
     if(alt) p_CFRelease(alt);
-    if(k) p_CFRelease(k);
+    p_CFRelease(a);
+    p_CFRelease(k);
+}
+
+/* Log what stock advertised, so a sender-negotiation failure is diagnosable. */
+static void log_stock_enabled_features(CFDictionaryRef base)
+{
+    CFStringRef k;
+    CFTypeRef v;
+    CFIndex i, n;
+    if(!base) return;
+    k = s_cf("enabledFeatures");
+    if(!k) return;
+    v = (CFTypeRef)p_CFDictionaryGetValue(base, k);
+    p_CFRelease(k);
+    if(!v){ logf_u2("GEN2 stock /info enabledFeatures=<absent>"); return; }
+    if(p_CFGetTypeID(v) != p_CFArrayGetTypeID()){
+        logf_u2("GEN2 stock /info enabledFeatures=<non-array>");
+        return;
+    }
+    n = p_CFArrayGetCount((CFArrayRef)v);
+    logf_u2("GEN2 stock /info enabledFeatures count=%ld", (long)n);
+    for(i = 0; i < n && i < 12; ++i){
+        CFTypeRef it = p_CFArrayGetValueAtIndex((CFArrayRef)v, i);
+        char b[64];
+        const char *pp = NULL;
+        if(it && p_CFGetTypeID(it) == p_CFStringGetTypeID()){
+            pp = p_CFStringGetCStringPtr((CFStringRef)it, CF_UTF8);
+            if(!pp && p_CFStringGetCString((CFStringRef)it, b, (CFIndex)sizeof(b), CF_UTF8))
+                pp = b;
+        }
+        logf_u2("GEN2 stock /info enabledFeatures[%ld]=%s", (long)i, pp ? pp : "<non-string>");
+    }
 }
 
 /* Clone the exact requested 111 descriptor and preserve unknown peer fields. */
@@ -1631,12 +1725,27 @@ static void *alt_receiver_thread(void *arg)
         for (;;) {
             fd_set rd; struct timeval tv; int n, current;
             pthread_mutex_lock(&g_lock); current = g_alt_listen; pthread_mutex_unlock(&g_lock);
-            if (current != listen_fd) break;
+            if (current != listen_fd) {
+                logf_u2("MHI2Q stream111: listener closed before accept");
+                return NULL;
+            }
+            /* QNX FD_SET indexes fds_bits with no range check (FD_SETSIZE is 256). */
+            if (listen_fd < 0 || listen_fd >= FD_SETSIZE) break;
             FD_ZERO(&rd); FD_SET(listen_fd, &rd);
             tv.tv_sec = 1; tv.tv_usec = 0;
             n = select(listen_fd + 1, &rd, NULL, NULL, &tv);
-            if (n > 0) break;
-            if (n < 0 && errno != EINTR) break;
+            if (n > 0) {
+                pthread_mutex_lock(&g_lock); current = g_alt_listen; pthread_mutex_unlock(&g_lock);
+                if (current != listen_fd) {
+                    logf_u2("MHI2Q stream111: listener closed before accept");
+                    return NULL;
+                }
+                break;
+            }
+            if (n < 0 && errno != EINTR) {
+                logf_u2("MHI2Q stream111: select failed: %s", strerror(errno));
+                return NULL;
+            }
             if (n == 0 && (++waited == 10u || waited % 60u == 0u))
                 logf_u2("MHI2Q stream111: no iPhone connection on port %d after %us "
                         "(SETUP answered; check unit firewall / CarPlay interface binding)",
@@ -2295,6 +2404,11 @@ CFDictionaryRef AirPlayCopyServerInfo(AirPlayReceiverSessionRef session, CFArray
     }
     base=g_real_serverinfo(session,properties,mac,outErr);
     if(!g_enabled||!base)return base;
+    log_stock_enabled_features(base);
+    if(!g_advertise){
+        logf_u2("GEN2 /info advertisement disabled (ALTSCREEN111_ADVERTISE=0); returning stock");
+        return base;
+    }
 
     info=dict_clone(base);
     if(!info)return base;
@@ -2948,7 +3062,7 @@ static int gen2_start_workers(void)
 
 /* ARM32 absolute jump trampoline: first 8 target bytes must be position-independent prologue. */
 static int install_arm_hook_expected(void *target, void *replacement, void **trampoline, const char *name,
-                                     uint32_t expected0, uint32_t expected1)
+                                     uint32_t expected0, uint32_t expected1, int allow_page_clone)
 {
 #if defined(__arm__)
     uint32_t *src=(uint32_t *)target;
@@ -3003,6 +3117,12 @@ static int install_arm_hook_expected(void *target, void *replacement, void **tra
         uint8_t *shadow;
         void *fixed;
         saved_errno=errno;
+        if(!allow_page_clone){
+            logf_u2("%s target mprotect RW denied page=%p size=%ld errno=%d %s; refusing MAP_FIXED (other threads may be executing this page)",
+                    name,(void *)page,ps,saved_errno,strerror(saved_errno));
+            munmap(tr,16);
+            return -1;
+        }
         logf_u2("%s target mprotect RW denied page=%p size=%ld errno=%d %s; trying anonymous MAP_FIXED clone",
                 name,(void *)page,ps,saved_errno,strerror(saved_errno));
 
@@ -3060,15 +3180,18 @@ static int install_arm_hook_expected(void *target, void *replacement, void **tra
     return 0;
 #else
     (void)target;(void)replacement;(void)trampoline;(void)name;
-    (void)expected0;(void)expected1;
+    (void)expected0;(void)expected1;(void)allow_page_clone;
     return 0; /* host syntax-test only */
 #endif
 }
 
+#ifndef ALT111_TARGET_MHI2Q
+/* MU1440 only: MHI2Q installs per-symbol with allow_page_clone=0. */
 static int install_arm_hook(void *target, void *replacement, void **trampoline, const char *name)
 {
-    return install_arm_hook_expected(target,replacement,trampoline,name,0xe92d4ff0u,0xed2d8b02u);
+    return install_arm_hook_expected(target,replacement,trampoline,name,0xe92d4ff0u,0xed2d8b02u,1);
 }
+#endif
 
 /*
  * Resolve the stock delegates. Idempotent and never fatal: the MU1440
@@ -3352,7 +3475,8 @@ static OSStatus mibr_session_setup(AirPlayReceiverSessionRef s, CFDictionaryRef 
         return e;
     }
 
-    if(stockResp)set_reference_enabled_features((CFMutableDictionaryRef)stockResp);
+    if(stockResp && g_advertise)
+        set_reference_enabled_features((CFMutableDictionaryRef)stockResp);
 
     hasAlt=g_enabled && contains_stream111(request,&altDesc,&other);
     if(!hasAlt){
@@ -3555,12 +3679,32 @@ static int gen2_configure_profile(void)
 }
 
 #ifdef ALT111_TARGET_MHI2Q
+/* 1 if the page can be made writable in place. Never MAP_FIXED: this runs
+ * after AirPlay threads exist, and replacing their text page crashes them. */
+static int text_page_mprotect_ok(void *target)
+{
+#if defined(__arm__)
+    long ps=sysconf(_SC_PAGESIZE);
+    uintptr_t page;
+    if(!target || ps<=0) return 0;
+    page=((uintptr_t)target)&~((uintptr_t)ps-1u);
+    if(mprotect((void *)page,(size_t)ps,PROT_READ|PROT_WRITE)!=0) return 0;
+    if(mprotect((void *)page,(size_t)ps,PROT_READ|PROT_EXEC)!=0){
+        logf_u2("MHI2Q inline hooks: restore RX failed page=%p errno=%d %s",
+                (void *)page,errno,strerror(errno));
+        return 0;
+    }
+    return 1;
+#else
+    (void)target;
+    return 1;
+#endif
+}
+
 /*
  * Optional inline-hook install for MHI2Q (ALTSCREEN111_INLINE_HOOKS=1). Default
- * is PLT interposition of the exported AirPlayReceiverSession* symbols. The
- * prologue expectations are the MU1438 (AUG22) offline-observed values; on a
- * different MHI2Q firmware install_arm_hook_expected() self-logs the actual
- * first two instruction words and skips only that function (PLT stays active).
+ * is PLT interposition. Prologue expectations are the MU1438 offline values.
+ * A mismatch or a text page that needs MAP_FIXED leaves that symbol on PLT.
  */
 static void gen2_install_inline_hooks(void)
 {
@@ -3573,18 +3717,30 @@ static void gen2_install_inline_hooks(void)
         logf_u2("MHI2Q inline hooks: missing target(s); staying on PLT interposition only");
         return;
     }
-    (void)install_arm_hook(setup,(void*)mibr_session_setup,
-                           (void**)&g_setup_trampoline,"SessionSetup(MHI2Q)");
-    (void)install_arm_hook(start,(void*)mibr_session_start,
-                           (void**)&g_start_trampoline,"SessionStart(MHI2Q)");
-    (void)install_arm_hook(td,(void*)mibr_session_teardown,
-                           (void**)&g_teardown_trampoline,"SessionTearDown(MHI2Q)");
-    (void)install_arm_hook_expected(platform,(void*)mibr_platform_control,
-                                    (void**)&g_platform_control_trampoline,
-                                    "PlatformControl(MHI2Q)",0xe92d4ff0u,0xed2d8b04u);
-    (void)install_arm_hook_expected(control,(void*)mibr_session_control,
-                                    (void**)&g_session_control_trampoline,
-                                    "SessionControl(MHI2Q)",0xe92d4ff0u,0xe1a06002u);
+    if(!text_page_mprotect_ok(setup)||!text_page_mprotect_ok(start)||!text_page_mprotect_ok(td)
+       ||!text_page_mprotect_ok(platform)||!text_page_mprotect_ok(control)){
+        logf_u2("MHI2Q inline hooks: text is not writable without MAP_FIXED; staying on PLT");
+        return;
+    }
+    if(install_arm_hook_expected(setup,(void*)mibr_session_setup,
+                                 (void**)&g_setup_trampoline,"SessionSetup(MHI2Q)",
+                                 0xe92d4ff0u,0xed2d8b02u,0)!=0 ||
+       install_arm_hook_expected(start,(void*)mibr_session_start,
+                                 (void**)&g_start_trampoline,"SessionStart(MHI2Q)",
+                                 0xe92d4ff0u,0xed2d8b02u,0)!=0 ||
+       install_arm_hook_expected(td,(void*)mibr_session_teardown,
+                                 (void**)&g_teardown_trampoline,"SessionTearDown(MHI2Q)",
+                                 0xe92d4ff0u,0xed2d8b02u,0)!=0 ||
+       install_arm_hook_expected(platform,(void*)mibr_platform_control,
+                                 (void**)&g_platform_control_trampoline,
+                                 "PlatformControl(MHI2Q)",0xe92d4ff0u,0xed2d8b04u,0)!=0 ||
+       install_arm_hook_expected(control,(void*)mibr_session_control,
+                                 (void**)&g_session_control_trampoline,
+                                 "SessionControl(MHI2Q)",0xe92d4ff0u,0xe1a06002u,0)!=0){
+        logf_u2("MHI2Q inline hooks: install incomplete; unpatched symbols stay on PLT");
+        return;
+    }
+    logf_u2("MHI2Q inline hooks installed");
 }
 #endif
 
@@ -3644,7 +3800,6 @@ static void altscreen111_init(void)
 #ifndef ALT111_TARGET_MHI2Q
     void *setup,*start,*td,*platform,*control;
 #endif
-    signal(SIGPIPE,SIG_IGN);
     g_enabled=env_i("ALTSCREEN111_ENABLED",1);
     g_alt_port=env_i("ALTSCREEN111_PORT",ALT111_DEFAULT_PORT);
     g_tee_port=env_i("ALTSCREEN111_TEE_PORT",19820);
@@ -3663,6 +3818,7 @@ static void altscreen111_init(void)
      */
     g_auto_show=0; /* Gen-2 control worker owns UI acquisition. */
     if(access(g_autoshow_disable_marker,F_OK)==0)g_auto_show=0;
+    g_advertise=env_i("ALTSCREEN111_ADVERTISE",1);
     g_viewareas=env_i("ALTSCREEN111_PARITY_VIEWAREAS",1);
     if(access(g_viewareas_marker,F_OK)==0)g_viewareas=1;
     /* Do not inherit Run117/118 legacy UUID/URL env values in the parity build. */
@@ -3671,20 +3827,18 @@ static void altscreen111_init(void)
     clear_video_observer();
     publish_state(g_enabled ? "initializing" : "disabled");
     if(!g_enabled)return;
-    if(init_api()!=0){
-        g_enabled=0;
-        publish_state("error");
-        logf_u2("GEN2 disabled: API initialization failed");
-        return;
-    }
 
+#ifdef ALT111_TARGET_MHI2Q
+    /*
+     * No dlsym and no SIGPIPE change in .init. dio_manager snapshots SIGPIPE
+     * on its first Cinemo call; SIG_IGN here would freeze that snapshot.
+     * init_api() runs from gen2_runtime_start and can retry.
+     */
     if(gen2_configure_profile()!=0){
         g_enabled=0;
         publish_state("error");
         return;
     }
-
-#ifdef ALT111_TARGET_MHI2Q
     g_mhi2q_want_inline=env_i("ALTSCREEN111_INLINE_HOOKS",0);
     active_alt_url_copy(active_url,sizeof(active_url));
     logf_u2("GEN2 MHI2Q constructor complete (deferred runtime): 111=%dx%d@%d physical=%dx%d altPort=%d tee=%d capture=%d URL=%s uuid=%s viewAreas=%d inlineHooks=%d bit26Mode=%d",
@@ -3692,10 +3846,16 @@ static void altscreen111_init(void)
             active_url,g_alt_uuid,g_viewareas,g_mhi2q_want_inline,airplay_bit26_mode());
     return;
 #else
+    signal(SIGPIPE,SIG_IGN);
     if(init_api()!=0){
         g_enabled=0;
         publish_state("error");
         logf_u2("GEN2 disabled: API initialization failed");
+        return;
+    }
+    if(gen2_configure_profile()!=0){
+        g_enabled=0;
+        publish_state("error");
         return;
     }
     if(gen2_start_workers()!=0){
@@ -3738,10 +3898,10 @@ static void altscreen111_init(void)
        install_arm_hook(td,(void *)mibr_session_teardown,(void **)&g_teardown_trampoline,"SessionTearDown")!=0 ||
        install_arm_hook_expected(platform,(void *)mibr_platform_control,
                                  (void **)&g_platform_control_trampoline,"PlatformControl",
-                                 0xe92d4ff0u,0xed2d8b04u)!=0 ||
+                                 0xe92d4ff0u,0xed2d8b04u,1)!=0 ||
        install_arm_hook_expected(control,(void *)mibr_session_control,
                                  (void **)&g_session_control_trampoline,"SessionControl",
-                                 0xe92d4ff0u,0xe1a06002u)!=0){
+                                 0xe92d4ff0u,0xe1a06002u,1)!=0){
         g_enabled=0;
         publish_state("error");
         logf_u2("direct hook install failed; disabled fail-closed");
